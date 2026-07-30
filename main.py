@@ -65,9 +65,10 @@ ALLOWED_HOSTS = {"pypi.org", "huggingface.co"}
 WORKING_DIR = os.path.normpath("/home/agent/workspace")
 
 def sanitize_path(raw_path: str) -> str:
-    """Repeatedly URL-decode and strip null bytes/variables to uncover hidden traversals."""
-    path = raw_path
-    # Decode double/triple URL encoding (e.g. %252e -> %2e -> .)
+    """Recursively URL-decode and replace variables specifically for /home/agent."""
+    path = str(raw_path)
+    
+    # Decode URL encoding up to 3 layers
     for _ in range(3):
         decoded = urllib.parse.unquote(path)
         if decoded == path:
@@ -77,9 +78,12 @@ def sanitize_path(raw_path: str) -> str:
     # Remove null bytes
     path = path.replace("\x00", "")
 
-    # Expand shell environment variables and tildes
-    path = os.path.expandvars(os.path.expanduser(path))
-    path = path.replace("$HOME", "/home/agent").replace("~", "/home/agent")
+    # Explicitly map $HOME and ~ to /home/agent (prevents host environment overrides)
+    path = path.replace("$HOME", "/home/agent")
+    if path == "~" or path.startswith("~/"):
+        path = "/home/agent" + path[1:]
+    elif "~" in path:
+        path = path.replace("~", "/home/agent")
     
     return path
 
@@ -125,10 +129,9 @@ def inspect_bash_command(cmd: str) -> tuple[str, str]:
     return "allow", "Command passed policy check."
 
 def inspect_write_file(path: str) -> tuple[str, str]:
-    if not path or not path.strip():
+    if not path or not str(path).strip():
         return "block", "File path cannot be empty."
 
-    # Fully sanitize and decode path traversals
     clean_path = sanitize_path(path)
 
     # Resolve relative paths against working directory
@@ -137,12 +140,12 @@ def inspect_write_file(path: str) -> tuple[str, str]:
     else:
         resolved_path = os.path.normpath(clean_path)
 
-    # Strict containment check using commonpath
+    # Containment verification using commonpath
     try:
         common = os.path.commonpath([resolved_path, ALLOWED_WRITE_DIR])
         if common == ALLOWED_WRITE_DIR:
             return "allow", "Write destination is within permitted build directory."
-    except ValueError:
+    except Exception:
         pass
 
     return "block", f"Writes outside of {ALLOWED_WRITE_DIR} are blocked."
