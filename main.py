@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import base64
 import urllib.parse
 from urllib.parse import urlparse
@@ -10,9 +11,9 @@ from typing import Literal
 
 app = FastAPI()
 
-# ==========================================
+# ======================================================
 # QUESTION 1: PRORATION CALCULATOR (v1 & v2)
-# ==========================================
+# ======================================================
 
 class ProrateRequest(BaseModel):
     old_price: float
@@ -55,9 +56,9 @@ async def prorate_handler(request: Request):
     return {"charge": compute_proration(data)}
 
 
-# ==========================================
+# ======================================================
 # QUESTION 2: GUARDRAIL HOOK (SECURITY POLICY)
-# ==========================================
+# ======================================================
 
 ALLOWED_WRITE_DIR = os.path.normpath("/home/agent/workspace/build")
 FORBIDDEN_FILE = os.path.normpath("/home/agent/credentials.env")
@@ -65,20 +66,14 @@ ALLOWED_HOSTS = {"pypi.org", "huggingface.co"}
 WORKING_DIR = os.path.normpath("/home/agent/workspace")
 
 def sanitize_path(raw_path: str) -> str:
-    """Recursively URL-decode and replace variables specifically for /home/agent."""
     path = str(raw_path)
-    
-    # Decode URL encoding up to 3 layers
     for _ in range(3):
         decoded = urllib.parse.unquote(path)
         if decoded == path:
             break
         path = decoded
 
-    # Remove null bytes
     path = path.replace("\x00", "")
-
-    # Explicitly map $HOME and ~ to /home/agent (prevents host environment overrides)
     path = path.replace("$HOME", "/home/agent")
     if path == "~" or path.startswith("~/"):
         path = "/home/agent" + path[1:]
@@ -88,7 +83,6 @@ def sanitize_path(raw_path: str) -> str:
     return path
 
 def decode_base64_strings(text: str) -> str:
-    """Find and decode base64 chunks in bash commands to inspect hidden payloads."""
     b64_pattern = re.compile(r'(?:[A-Za-z0-9+/]{4}){3,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
     decoded_text = text
     for match in b64_pattern.findall(text):
@@ -134,13 +128,11 @@ def inspect_write_file(path: str) -> tuple[str, str]:
 
     clean_path = sanitize_path(path)
 
-    # Resolve relative paths against working directory
     if not os.path.isabs(clean_path):
         resolved_path = os.path.normpath(os.path.join(WORKING_DIR, clean_path))
     else:
         resolved_path = os.path.normpath(clean_path)
 
-    # Containment verification using commonpath
     try:
         common = os.path.commonpath([resolved_path, ALLOWED_WRITE_DIR])
         if common == ALLOWED_WRITE_DIR:
@@ -183,9 +175,102 @@ def process_guardrail(payload: dict) -> dict:
     return {"decision": decision, "reason": reason}
 
 
-# ==========================================
-# ROUTING & CATCH-ALL HANDLERS
-# ==========================================
+# ======================================================
+# QUESTION 3: RUN-BUDGET & LOOP GUARD (/check)
+# ======================================================
+
+IGNORE_KEYS = {"request_id", "requestid", "_request_id", "trace_id", "traceid"}
+
+def canonicalize_arg_value(val):
+    """Normalize whitespace in strings and recursively canonicalize dicts/lists."""
+    if isinstance(val, str):
+        # Collapse multi-space/tab/newline into a single space and strip whitespace
+        return " ".join(val.split())
+    elif isinstance(val, dict):
+        # Drop ignored keys (like client-side tracing request_id)
+        return {
+            k: canonicalize_arg_value(v)
+            for k, v in sorted(val.items())
+            if k.lower() not in IGNORE_KEYS
+        }
+    elif isinstance(val, list):
+        return [canonicalize_arg_value(x) for x in val]
+    else:
+        return val
+
+def get_step_signature(step: dict) -> str:
+    """Creates a deterministic string representation for a tool call step."""
+    tool = step.get("tool", "")
+    raw_args = step.get("args", {})
+    clean_args = canonicalize_arg_value(raw_args)
+    return f"{tool}::{json.dumps(clean_args, sort_keys=True)}"
+
+def check_run_control(payload: dict) -> dict:
+    budget_tokens = payload.get("budget_tokens", 42000)
+    steps = payload.get("steps", [])
+
+    # 1. Budget Rule: Check cumulative tokens
+    total_tokens = sum(s.get("tokens_used", 0) for s in steps)
+    if total_tokens >= budget_tokens:
+        return {
+            "decision": "halt",
+            "reason": f"Cumulative tokens_used ({total_tokens}) has reached or exceeded the budget ({budget_tokens})."
+        }
+
+    # 2. Loop Rule: Examine trailing steps if history exists
+    if len(steps) >= 3:
+        signatures = [get_step_signature(s) for s in steps]
+
+        # Case A: 3 or more identical tool calls in a row
+        if len(signatures) >= 3:
+            last_3 = signatures[-3:]
+            if len(set(last_3)) == 1:
+                return {
+                    "decision": "halt",
+                    "reason": f"Detected infinite loop: same tool called 3 consecutive times with functionally identical args."
+                }
+
+        # Case B: 2-step alternating cycle (A, B, A, B, A, B) over the last 6 steps
+        if len(signatures) >= 6:
+            last_6 = signatures[-6:]
+            if (last_6[0] == last_6[2] == last_6[4] and 
+                last_6[1] == last_6[3] == last_6[5] and 
+                last_6[0] != last_6[1]):
+                return {
+                    "decision": "halt",
+                    "reason": "Detected infinite loop: 2-step alternating cycle repeated 6 times."
+                }
+
+    # 3. Default Continue
+    return {
+        "decision": "continue",
+        "reason": f"Well under budget ({total_tokens}/{budget_tokens}); run is making progress."
+    }
+
+
+# ======================================================
+# ROUTING & ENDPOINTS
+# ======================================================
+
+@app.api_route("/check", methods=["GET", "POST"])
+async def check_handler(request: Request):
+    if request.method == "GET":
+        return {"status": "ok"}
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    return check_run_control(data)
+
+@app.api_route("/guardrail", methods=["GET", "POST"])
+async def guardrail_handler(request: Request):
+    if request.method == "GET":
+        return {"status": "ok"}
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    return process_guardrail(data)
 
 @app.api_route("/", methods=["GET", "POST"])
 async def root_handler(request: Request):
@@ -197,18 +282,10 @@ async def root_handler(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     
-    if "tool" in data:
+    # Auto-detect routing based on payload properties
+    if "steps" in data or "budget_tokens" in data:
+        return check_run_control(data)
+    elif "tool" in data:
         return process_guardrail(data)
     else:
         return {"charge": compute_proration(data)}
-
-@app.api_route("/guardrail", methods=["GET", "POST"])
-@app.api_route("/check", methods=["GET", "POST"])
-async def guardrail_handler(request: Request):
-    if request.method == "GET":
-        return {"status": "ok"}
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    return process_guardrail(data)
