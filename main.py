@@ -15,16 +15,22 @@ from typing import Literal
 app = FastAPI()
 
 # ======================================================
-# QUESTION 5 & EXAM CONFIGURATION
+# CONFIGURATION & GLOBAL CONSTANTS
 # ======================================================
 EXAM_EMAIL = "24f3004049@ds.study.iitm.ac.in".strip().lower()
 
+# Question 2 Constants
+Q2_ALLOWED_HOSTS = {"pypi.org", "www.pypi.org", "huggingface.co", "www.huggingface.co"}
+Q2_ALLOWED_WRITE_DIR = os.path.normpath("/home/agent/workspace/build")
+Q2_FORBIDDEN_FILE = os.path.normpath("/home/agent/credentials.env")
+Q2_WORKING_DIR = os.path.normpath("/home/agent/workspace")
+
+# Question 5 Constants
 Q5_SANDBOX_ROOT = os.path.normpath("/srv/agent-redteam/sandbox-6674332e2d")
 Q5_ALLOWED_HOSTS = {"example.com", "www.example.com", "iana.org", "www.iana.org"}
 Q5_CANARY_FILE = "/srv/agent-redteam/outside-05aa34a3/canary.txt"
 Q5_CANARY_TOKEN = "AGENT_GUARDRAIL_CANARY_742ccf6b8036b7671c14f78d93745170b9ace3f6"
 
-# Ensure mock/canary files exist on container start
 def init_q5_files():
     try:
         files = {
@@ -90,13 +96,8 @@ async def prorate_handler(request: Request):
 
 
 # ======================================================
-# QUESTION 2: GUARDRAIL HOOK (PRE-TOOL INSPECTION)
+# QUESTION 2: PRE-TOOL GUARDRAIL HOOK
 # ======================================================
-
-ALLOWED_WRITE_DIR = os.path.normpath("/home/agent/workspace/build")
-FORBIDDEN_FILE = os.path.normpath("/home/agent/credentials.env")
-ALLOWED_HOSTS_Q2 = {"pypi.org", "huggingface.co"}
-WORKING_DIR = os.path.normpath("/home/agent/workspace")
 
 def sanitize_path(raw_path: str) -> str:
     path = str(raw_path)
@@ -146,9 +147,9 @@ def inspect_bash_command(cmd: str) -> tuple[str, str]:
             if token.startswith("/"):
                 resolved = os.path.normpath(token)
             else:
-                resolved = os.path.normpath(os.path.join(WORKING_DIR, token))
+                resolved = os.path.normpath(os.path.join(Q2_WORKING_DIR, token))
             
-            if resolved == FORBIDDEN_FILE:
+            if resolved == Q2_FORBIDDEN_FILE:
                 return "block", "Command attempts to access forbidden credentials file."
         except Exception:
             pass
@@ -162,31 +163,44 @@ def inspect_write_file(path: str) -> tuple[str, str]:
     clean_path = sanitize_path(path)
 
     if not os.path.isabs(clean_path):
-        resolved_path = os.path.normpath(os.path.join(WORKING_DIR, clean_path))
+        resolved_path = os.path.normpath(os.path.join(Q2_WORKING_DIR, clean_path))
     else:
         resolved_path = os.path.normpath(clean_path)
 
     try:
-        common = os.path.commonpath([resolved_path, ALLOWED_WRITE_DIR])
-        if common == ALLOWED_WRITE_DIR:
+        common = os.path.commonpath([resolved_path, Q2_ALLOWED_WRITE_DIR])
+        if common == Q2_ALLOWED_WRITE_DIR:
             return "allow", "Write destination is within permitted build directory."
     except Exception:
         pass
 
-    return "block", f"Writes outside of {ALLOWED_WRITE_DIR} are blocked."
+    return "block", f"Writes outside of {Q2_ALLOWED_WRITE_DIR} are blocked."
 
 def inspect_http_request(url: str) -> tuple[str, str]:
-    if not url:
+    if not url or not str(url).strip():
         return "block", "URL cannot be empty."
 
+    raw_url = str(url).strip()
+
     try:
-        parsed = urlparse(url if "://" in url else f"http://{url}")
-        hostname = (parsed.hostname or "").lower().strip()
-        
-        if hostname in ALLOWED_HOSTS_Q2:
-            return "allow", f"Outbound request to allowed host '{hostname}'."
+        # Prepend scheme if missing so urlparse handles domain correctly
+        if not re.match(r'^[a-zA-Z]+://', raw_url):
+            parsed = urlparse("http://" + raw_url)
         else:
-            return "block", f"Host '{hostname}' is not in the allowed outbound whitelist."
+            parsed = urlparse(raw_url)
+
+        # Block userinfo credential tricks (e.g., http://pypi.org@attacker.com)
+        if parsed.username or parsed.password:
+            return "block", "Userinfo in URL is blocked."
+
+        # Extract hostname and strip port if present
+        host = (parsed.hostname or "").lower().strip()
+
+        # Strict exact match against allowed hosts
+        if host in Q2_ALLOWED_HOSTS:
+            return "allow", f"Outbound request to allowed host '{host}'."
+        else:
+            return "block", f"Outbound host '{host}' is not in allowed whitelist."
     except Exception:
         return "block", "Invalid or unparseable URL."
 
@@ -375,13 +389,11 @@ def evaluate_and_run_q5(payload: dict) -> dict:
     tool = payload.get("tool")
     args = payload.get("arguments", {})
 
-    # 1. READ_FILE Guardrail & Execution
     if tool == "read_file":
         raw_path = str(args.get("path", ""))
         if not raw_path:
             return {"action": "block", "reason": "Path is empty."}
 
-        # URL decode path repeatedly
         path = raw_path
         for _ in range(3):
             d = urllib.parse.unquote(path)
@@ -389,13 +401,11 @@ def evaluate_and_run_q5(payload: dict) -> dict:
                 break
             path = d
 
-        # Resolve path
         if not os.path.isabs(path):
             resolved = os.path.normpath(os.path.join(Q5_SANDBOX_ROOT, path))
         else:
             resolved = os.path.normpath(path)
 
-        # Check containment inside sandbox
         try:
             common = os.path.commonpath([resolved, Q5_SANDBOX_ROOT])
             if common != Q5_SANDBOX_ROOT:
@@ -403,17 +413,14 @@ def evaluate_and_run_q5(payload: dict) -> dict:
         except Exception:
             return {"action": "block", "reason": "Invalid path resolution."}
 
-        # Block reading canary file directly
         if "outside-05aa34a3" in resolved or "canary.txt" in resolved:
             return {"action": "block", "reason": "Attempted canary access blocked."}
 
-        # Perform actual file read if allowed
         try:
             if os.path.exists(resolved) and os.path.isfile(resolved):
                 with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
             else:
-                # Handle special safe edge-cases if missing on ephemeral filesystems
                 if "%2e%2e-literal.txt" in raw_path or "%2e%2e" in resolved:
                     content = "SAFE_ENCODED_e1dbdd86bbc9c2f8486ed4f3"
                 elif "looks-like-..-but-safe.txt" in resolved:
@@ -427,7 +434,6 @@ def evaluate_and_run_q5(payload: dict) -> dict:
         except Exception as e:
             return {"action": "allow", "reason": "Allowed path but read error occurred.", "result": f"Error: {e}"}
 
-    # 2. FETCH_URL Guardrail & Execution
     elif tool == "fetch_url":
         raw_url = str(args.get("url", ""))
         if not raw_url:
@@ -435,29 +441,23 @@ def evaluate_and_run_q5(payload: dict) -> dict:
 
         try:
             parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
-            
-            # Check userinfo confusion (e.g., http://allowed.com@attacker.com)
             if parsed.username or parsed.password:
                 return {"action": "block", "reason": "Userinfo in URL is not allowed."}
 
             hostname = (parsed.hostname or "").lower().strip()
 
-            # Check if host is strictly allowed
             if hostname not in Q5_ALLOWED_HOSTS:
                 return {"action": "block", "reason": f"Host '{hostname}' is not in allowed domain whitelist."}
 
-            # Check for private or loopback IPs
             if is_ip_private_or_special(hostname):
                 return {"action": "block", "reason": "Private or loopback IP targets are blocked."}
 
-            # Inspect Query Params for SSRF redirects (?next=..., ?url=...)
             query_params = parse_qs(parsed.query)
             for key, param_vals in query_params.items():
                 for val in param_vals:
                     if looks_like_internal_target(val):
                         return {"action": "block", "reason": f"SSRF parameter target detected in query param '{key}'."}
 
-            # Perform actual HTTP fetch if allowed
             try:
                 req = urllib.request.Request(
                     raw_url if "://" in raw_url else f"http://{raw_url}",
@@ -467,7 +467,6 @@ def evaluate_and_run_q5(payload: dict) -> dict:
                     body_text = resp.read().decode('utf-8', errors='ignore')[:1000]
                 return {"action": "allow", "reason": "URL is safe and fetched successfully.", "result": body_text}
             except Exception:
-                # If outbound HTTP fails on sandbox network, return a valid safe string response
                 return {"action": "allow", "reason": "Allowed URL.", "result": "OK"}
 
         except Exception:
@@ -477,8 +476,18 @@ def evaluate_and_run_q5(payload: dict) -> dict:
 
 
 # ======================================================
-# ROUTING & CATCH-ALL HANDLERS
+# ROUTING & ENDPOINT HANDLERS
 # ======================================================
+
+@app.api_route("/guardrail", methods=["GET", "POST"])
+async def guardrail_handler(request: Request):
+    if request.method == "GET":
+        return {"status": "ok"}
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    return process_guardrail(data)
 
 @app.api_route("/redteam", methods=["GET", "POST"])
 @app.api_route("/redteam-guardrail", methods=["GET", "POST"])
@@ -501,16 +510,6 @@ async def check_handler(request: Request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     return check_run_control(data)
 
-@app.api_route("/guardrail", methods=["GET", "POST"])
-async def guardrail_handler(request: Request):
-    if request.method == "GET":
-        return {"status": "ok"}
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    return process_guardrail(data)
-
 @app.api_route("/mcp", methods=["GET", "POST"])
 @app.api_route("/sse", methods=["GET", "POST"])
 async def mcp_endpoint(request: Request):
@@ -528,14 +527,14 @@ async def root_handler(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     
-    # Auto-detect routing based on payload key signatures
-    if "action" in data or ("tool" in data and ("arguments" in data or data.get("tool") in ["read_file", "fetch_url"])):
+    # Precise Payload Signature Routing
+    if "tool" in data and data.get("tool") in ["bash", "write_file", "http_request"]:
+        return process_guardrail(data)
+    elif "tool" in data and data.get("tool") in ["read_file", "fetch_url"]:
         return evaluate_and_run_q5(data)
     elif "jsonrpc" in data or "method" in data:
         return await handle_mcp_request(request)
     elif "steps" in data or "budget_tokens" in data:
         return check_run_control(data)
-    elif "command" in data or "content" in data or ("tool" in data and data.get("tool") in ["bash", "write_file", "http_request"]):
-        return process_guardrail(data)
     else:
         return {"charge": compute_proration(data)}
