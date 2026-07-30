@@ -1,6 +1,7 @@
 import os
 import re
 import base64
+import urllib.parse
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -21,7 +22,6 @@ class ProrateRequest(BaseModel):
     spec: Literal["v1", "v2"]
 
 def compute_proration(payload: dict) -> float:
-    # 1. Flexible Extraction & Parsing
     old_price = float(payload.get("old_price", 0))
     new_price = float(payload.get("new_price", 0))
     days_remaining = float(payload.get("days_remaining", 0))
@@ -32,7 +32,6 @@ def compute_proration(payload: dict) -> float:
     spec = str(payload.get("spec", "v2")).strip().lower()
     price_delta = new_price - old_price
 
-    # 2. Spec branching
     if spec == "v1":
         raw_charge = price_delta * (days_remaining / 30.0)
     elif spec == "v2":
@@ -43,7 +42,6 @@ def compute_proration(payload: dict) -> float:
     else:
         raw_charge = price_delta * (days_remaining / days_in_actual_month)
 
-    # 3. Rounding (+ 1e-9 avoids floating-point round-to-even drift)
     return round(raw_charge + 1e-9, 2)
 
 @app.api_route("/prorate", methods=["GET", "POST"])
@@ -66,6 +64,25 @@ FORBIDDEN_FILE = os.path.normpath("/home/agent/credentials.env")
 ALLOWED_HOSTS = {"pypi.org", "huggingface.co"}
 WORKING_DIR = os.path.normpath("/home/agent/workspace")
 
+def sanitize_path(raw_path: str) -> str:
+    """Repeatedly URL-decode and strip null bytes/variables to uncover hidden traversals."""
+    path = raw_path
+    # Decode double/triple URL encoding (e.g. %252e -> %2e -> .)
+    for _ in range(3):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+
+    # Remove null bytes
+    path = path.replace("\x00", "")
+
+    # Expand shell environment variables and tildes
+    path = os.path.expandvars(os.path.expanduser(path))
+    path = path.replace("$HOME", "/home/agent").replace("~", "/home/agent")
+    
+    return path
+
 def decode_base64_strings(text: str) -> str:
     """Find and decode base64 chunks in bash commands to inspect hidden payloads."""
     b64_pattern = re.compile(r'(?:[A-Za-z0-9+/]{4}){3,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
@@ -80,29 +97,21 @@ def decode_base64_strings(text: str) -> str:
     return decoded_text
 
 def inspect_bash_command(cmd: str) -> tuple[str, str]:
-    # 1. Block reading system shadow / sensitive files explicitly
     if "/etc/shadow" in cmd:
         return "block", "Reading /etc/shadow is never permitted."
 
-    # 2. Expand common shell variable/home expansions
-    normalized_cmd = cmd.replace("$HOME", "/home/agent").replace("~", "/home/agent")
-    
-    # 3. Decode potential base64 wrapped payloads
+    normalized_cmd = sanitize_path(cmd)
     full_inspection_str = decode_base64_strings(normalized_cmd)
 
-    # 4. Check for direct secret file access
-    # Regex targets exact filename boundaries to avoid over-blocking files like 'credentials.env.example'
     secret_regex = re.compile(r'(^|[\s/\'"]+)credentials\.env($|[\s/\'"]+)')
     if secret_regex.search(full_inspection_str):
         return "block", "Access to /home/agent/credentials.env is strictly forbidden."
 
-    # 5. Extract all tokens and check for path traversal leading to FORBIDDEN_FILE
     tokens = re.split(r'[\s\'";|&><]+', full_inspection_str)
     for token in tokens:
         if not token or token.startswith("-"):
             continue
         try:
-            # Resolve relative paths against working directory
             if token.startswith("/"):
                 resolved = os.path.normpath(token)
             else:
@@ -119,8 +128,8 @@ def inspect_write_file(path: str) -> tuple[str, str]:
     if not path or not path.strip():
         return "block", "File path cannot be empty."
 
-    # Expand variables and home paths
-    clean_path = path.replace("$HOME", "/home/agent").replace("~", "/home/agent")
+    # Fully sanitize and decode path traversals
+    clean_path = sanitize_path(path)
 
     # Resolve relative paths against working directory
     if not os.path.isabs(clean_path):
@@ -128,7 +137,7 @@ def inspect_write_file(path: str) -> tuple[str, str]:
     else:
         resolved_path = os.path.normpath(clean_path)
 
-    # Robust containment check using commonpath
+    # Strict containment check using commonpath
     try:
         common = os.path.commonpath([resolved_path, ALLOWED_WRITE_DIR])
         if common == ALLOWED_WRITE_DIR:
@@ -185,7 +194,6 @@ async def root_handler(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     
-    # Auto-detect problem type based on payload keys
     if "tool" in data:
         return process_guardrail(data)
     else:
