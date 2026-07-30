@@ -2,6 +2,7 @@ import os
 import re
 import json
 import base64
+import hashlib
 import urllib.parse
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request
@@ -10,6 +11,9 @@ from pydantic import BaseModel
 from typing import Literal
 
 app = FastAPI()
+
+# Config for Question 4 MCP Server
+EXAM_EMAIL = "24f3004049@ds.study.iitm.ac.in".strip().lower()
 
 # ======================================================
 # QUESTION 1: PRORATION CALCULATOR (v1 & v2)
@@ -182,12 +186,9 @@ def process_guardrail(payload: dict) -> dict:
 IGNORE_KEYS = {"request_id", "requestid", "_request_id", "trace_id", "traceid"}
 
 def canonicalize_arg_value(val):
-    """Normalize whitespace in strings and recursively canonicalize dicts/lists."""
     if isinstance(val, str):
-        # Collapse multi-space/tab/newline into a single space and strip whitespace
         return " ".join(val.split())
     elif isinstance(val, dict):
-        # Drop ignored keys (like client-side tracing request_id)
         return {
             k: canonicalize_arg_value(v)
             for k, v in sorted(val.items())
@@ -199,7 +200,6 @@ def canonicalize_arg_value(val):
         return val
 
 def get_step_signature(step: dict) -> str:
-    """Creates a deterministic string representation for a tool call step."""
     tool = step.get("tool", "")
     raw_args = step.get("args", {})
     clean_args = canonicalize_arg_value(raw_args)
@@ -209,7 +209,6 @@ def check_run_control(payload: dict) -> dict:
     budget_tokens = payload.get("budget_tokens", 42000)
     steps = payload.get("steps", [])
 
-    # 1. Budget Rule: Check cumulative tokens
     total_tokens = sum(s.get("tokens_used", 0) for s in steps)
     if total_tokens >= budget_tokens:
         return {
@@ -217,11 +216,9 @@ def check_run_control(payload: dict) -> dict:
             "reason": f"Cumulative tokens_used ({total_tokens}) has reached or exceeded the budget ({budget_tokens})."
         }
 
-    # 2. Loop Rule: Examine trailing steps if history exists
     if len(steps) >= 3:
         signatures = [get_step_signature(s) for s in steps]
 
-        # Case A: 3 or more identical tool calls in a row
         if len(signatures) >= 3:
             last_3 = signatures[-3:]
             if len(set(last_3)) == 1:
@@ -230,7 +227,6 @@ def check_run_control(payload: dict) -> dict:
                     "reason": f"Detected infinite loop: same tool called 3 consecutive times with functionally identical args."
                 }
 
-        # Case B: 2-step alternating cycle (A, B, A, B, A, B) over the last 6 steps
         if len(signatures) >= 6:
             last_6 = signatures[-6:]
             if (last_6[0] == last_6[2] == last_6[4] and 
@@ -241,7 +237,6 @@ def check_run_control(payload: dict) -> dict:
                     "reason": "Detected infinite loop: 2-step alternating cycle repeated 6 times."
                 }
 
-    # 3. Default Continue
     return {
         "decision": "continue",
         "reason": f"Well under budget ({total_tokens}/{budget_tokens}); run is making progress."
@@ -249,7 +244,113 @@ def check_run_control(payload: dict) -> dict:
 
 
 # ======================================================
-# ROUTING & ENDPOINTS
+# QUESTION 4: MCP SERVER (MODEL CONTEXT PROTOCOL)
+# ======================================================
+
+def compute_challenge_response(challenge: str) -> str:
+    s = f"{challenge}:{EXAM_EMAIL}"
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()[:16]
+
+async def handle_mcp_request(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None}, status_code=400)
+
+    method = body.get("method")
+    req_id = body.get("id")
+
+    # 1. MCP initialize handshake
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "exam-mcp-server",
+                    "version": "1.0.0"
+                }
+            }
+        })
+
+    # 2. MCP initialized notification (no id response needed for notifications)
+    if method == "notifications/initialized":
+        return JSONResponse({"jsonrpc": "2.0", "result": {}}, status_code=200)
+
+    # 3. List Tools
+    if method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "solve_challenge",
+                        "description": "Solves exam challenge using HTTP header challenge token.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                ]
+            }
+        })
+
+    # 4. Call Tool
+    if method == "tools/call":
+        params = body.get("params", {})
+        tool_name = params.get("name")
+
+        if tool_name == "solve_challenge":
+            # Extract challenge from HTTP request header
+            challenge = request.headers.get("X-Exam-Challenge") or request.headers.get("x-exam-challenge", "")
+            
+            # Fallback if header is missing
+            if not challenge:
+                challenge = params.get("arguments", {}).get("challenge", "")
+
+            response_text = compute_challenge_response(challenge)
+
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": response_text
+                        }
+                    ]
+                }
+            })
+
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"},
+            "id": req_id
+        }, status_code=404)
+
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "error": {"code": -32601, "message": f"Method '{method}' not found"},
+        "id": req_id
+    }, status_code=400)
+
+@app.api_route("/mcp", methods=["GET", "POST"])
+@app.api_route("/sse", methods=["GET", "POST"])
+async def mcp_endpoint(request: Request):
+    if request.method == "GET":
+        return {"status": "MCP server online"}
+    return await handle_mcp_request(request)
+
+
+# ======================================================
+# ROUTING & CATCH-ALL HANDLERS
 # ======================================================
 
 @app.api_route("/check", methods=["GET", "POST"])
@@ -283,7 +384,9 @@ async def root_handler(request: Request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     
     # Auto-detect routing based on payload properties
-    if "steps" in data or "budget_tokens" in data:
+    if "jsonrpc" in data or "method" in data:
+        return await handle_mcp_request(request)
+    elif "steps" in data or "budget_tokens" in data:
         return check_run_control(data)
     elif "tool" in data:
         return process_guardrail(data)
